@@ -643,7 +643,9 @@ function profileSection(q,s,pl,h){
           ?' <span class="pool-chip exhausted" title="Subscription or payment refused — this does not clear on its own">subscription refused</span>'
           :exh.reason==='requires_reauth'
             ?' <span class="pool-chip exhausted" title="chatgpt.com refused this seat\u2019s access token; it is tried again then">token refused · retry '+resetIn(exh.until)+'</span>'
-            :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+            :exh.reason==='authentication_error'
+              ?' <span class="pool-chip exhausted" title="This profile\u2019s sign-in expired and Meridian could not refresh it; sign it in again, or it is tried again then">signed out · retry '+resetIn(exh.until)+'</span>'
+              :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
       }
     }
     if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
