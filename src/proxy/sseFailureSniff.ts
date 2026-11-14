@@ -263,10 +263,13 @@ export function createSseRelayStream(
 }
 
 /** Raw bytes remain held until their entire chunk is classified. In particular,
- * an empty decoded tail is not proof that TextDecoder holds no UTF-8 bytes. */
+ * an empty decoded tail is not proof that TextDecoder holds no UTF-8 bytes.
+ * `signInLost` is read when an error frame arrives: the attempt sets it before
+ * delivering the error it describes (`isAccountFailoverError`). */
 export async function relayStreamAttempt(
   inner: Response,
   opts: SseRelaySink,
+  signInLost: () => boolean = () => false,
 ): Promise<StreamAttemptVerdict> {
   const reader = inner.body?.getReader()
   if (!reader) return { kind: "relayed" }
@@ -331,7 +334,7 @@ export async function relayStreamAttempt(
         payload = { type: "error", error: { type: "api_error", message: `Expected an SSE response; upstream returned status ${inner.status}` } }
       }
       const frame = new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
-      if (!inner.ok && isAccountFailoverError(errorType)) {
+      if (!inner.ok && isAccountFailoverError(errorType, signInLost())) {
         transferred = true
         return { kind: "suppressed", errorPayload: payload, errorType, held: [frame], discard }
       }
@@ -367,7 +370,7 @@ export async function relayStreamAttempt(
         const frame = scanner.next()
         if (!frame) break
         if (frame.kind === "keepalive") continue
-        if (frame.kind === "error" && isAccountFailoverError(frame.errorType)) {
+        if (frame.kind === "error" && isAccountFailoverError(frame.errorType, signInLost())) {
           transferred = true
           return { kind: "suppressed", errorPayload: frame.payload, errorType: frame.errorType, held, discard }
         }

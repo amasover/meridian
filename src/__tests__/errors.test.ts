@@ -2,7 +2,7 @@
  * Unit tests for classifyError — pure function, no mocks needed.
  */
 import { describe, it, expect } from "bun:test"
-import { assistantRefusalOf, canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
+import { assistantRefusalOf, canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isExpiredTokenError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
 
 describe("assistantRefusalOf", () => {
   const details = { type: "refusal", category: "cyber" }
@@ -1270,8 +1270,15 @@ describe("isAccountFailoverError", () => {
     expect(isAccountFailoverError("upstream_timeout")).toBe(false)
   })
 
-  it("rejects authentication_error, which the token refresh recovers in place", () => {
+  it("rejects authentication_error while the token refresh may still recover it in place", () => {
     expect(isAccountFailoverError("authentication_error")).toBe(false)
+  })
+
+  it("accepts authentication_error once the account's sign-in is known lost", () => {
+    expect(isAccountFailoverError("authentication_error", true)).toBe(true)
+    // A lost sign-in says nothing about an account-blind failure.
+    expect(isAccountFailoverError("api_error", true)).toBe(false)
+    expect(isAccountFailoverError(null, true)).toBe(false)
   })
 
   it("rejects a missing or malformed type rather than guessing", () => {
@@ -1285,6 +1292,50 @@ describe("isAccountFailoverError", () => {
     expect(classified.type).toBe("billing_error")
     expect(classified.status).toBe(402)
     expect(isAccountFailoverError(classified.type)).toBe(true)
+  })
+})
+
+describe("classifyError: a sign-in Claude Code could not refresh", () => {
+  // Claude Code's error result when its OAuth refresh failed, observed live
+  // through the SDK (2026-11-14): every request on that account failed with it
+  // for ten hours while a signed-in account in the same pool sat unused.
+  const SIGNED_OUT = "Claude Code returned an error result: Failed to authenticate: OAuth session expired and could not be refreshed"
+
+  it("classifies the live text as authentication_error", () => {
+    const r = classifyError(SIGNED_OUT)
+    expect(r.type).toBe("authentication_error")
+    expect(r.status).toBe(401)
+    expect(isExpiredTokenError(SIGNED_OUT)).toBe(true)
+  })
+
+  it("classifies it with captured stderr appended", () => {
+    const msg = `${SIGNED_OUT}\nSubprocess stderr: [warn] custom betas ignored\nsome later line`
+    expect(classifyError(msg).type).toBe("authentication_error")
+    expect(isExpiredTokenError(msg)).toBe(true)
+  })
+
+  it("covers the CLI's other wordings for the same failure", () => {
+    for (const msg of [
+      "Claude Code returned an error result: Failed to authenticate: this login reached its time limit · Sign in again to continue",
+      "Claude Code returned an error result: Failed to authenticate: this login reached its time limit and cannot be renewed. Run claude login",
+      "Claude Code returned an error result: Login expired · Please run /login",
+      "Claude Code returned an error result: Login reached its time limit · Please run /login",
+    ]) {
+      expect(classifyError(msg).type).toBe("authentication_error")
+      expect(isExpiredTokenError(msg)).toBe(true)
+    }
+  })
+
+  it("does not take the sentence quoted mid-line, which could bench a healthy account", () => {
+    const msg = "Tool output: the runbook says Failed to authenticate: OAuth session expired and could not be refreshed means sign in again"
+    expect(classifyError(msg).type).not.toBe("authentication_error")
+    expect(isExpiredTokenError(msg)).toBe(false)
+  })
+
+  it("leaves the CLI's refresh-lock contention alone, which clears by itself", () => {
+    const msg = "Claude Code returned an error result: Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute"
+    expect(classifyError(msg).type).not.toBe("authentication_error")
+    expect(isExpiredTokenError(msg)).toBe(false)
   })
 })
 

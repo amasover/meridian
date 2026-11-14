@@ -315,6 +315,23 @@ const CONTEXT_OVERFLOW_SIGNALS: readonly RegExp[] = OVERFLOW_PHRASES.map(
   ),
 )
 
+/** Claude Code's error result when the account's sign-in is gone: its own
+ *  OAuth refresh failed, or the login reached its time limit. Observed live
+ *  (2026-11-14) as "Claude Code returned an error result: Failed to
+ *  authenticate: OAuth session expired and could not be refreshed"; the other
+ *  wordings are the CLI's variants of the same failure (the `/login` ones are
+ *  its interactive spelling). None of them said "401", "authentication" or
+ *  "credentials", so the message fell through to a generic 500 api_error,
+ *  Meridian's own refresh never ran, and priority routing kept every request on
+ *  the account.
+ *
+ *  Line-anchored after the known SDK wrappers, like the refusal banners above:
+ *  this text can bench an account in a pool, so a tool output quoting it
+ *  mid-line must not match. Not matched: "Failed to refresh OAuth token:
+ *  another Claude Code process is refreshing it", which is lock contention the
+ *  CLI itself calls transient. */
+const SIGN_IN_LOST = /^\s*(?:(?:error|api error|claude code returned an error result|subprocess stderr):\s*)*(?:failed to authenticate: (?:oauth session expired and could not be refreshed|this login reached its time limit)|login (?:expired|reached its time limit)\b)/m
+
 /**
  * Detect specific SDK errors and return helpful messages to the client.
  *
@@ -330,6 +347,7 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
     lower.includes("oauth token has expired")
     || lower.includes("oauth access token has expired")
     || lower.includes("not logged in")
+    || SIGN_IN_LOST.test(lower)
   ) {
     return {
       status: 401,
@@ -560,6 +578,10 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
  *   - "OAuth token has expired" / "OAuth access token has expired" / "Not
  *     logged in" — CLI-emitted (subprocess either got 401 with this wording
  *     from Anthropic or detected expiry locally before sending).
+ *   - `SIGN_IN_LOST` — the CLI's own refresh already failed. Meridian's
+ *     refresh may still succeed (it reads the same stored refresh token, but
+ *     a sign-in written since the CLI started is picked up), and when it does
+ *     not, the caller knows the sign-in is lost (priority failover).
  *   - "invalid_token" / "token_expired" — RFC 6750 resource-server errors that
  *     can appear in the API response body.
  *   - "401" + ("authentication" | "unauthorized" | "invalid") — generic 401
@@ -569,7 +591,9 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
  *
  * False positives only cost one OAuth round-trip — the refresh is single-shot
  * per request (gated by `tokenRefreshed` in server.ts) and surfaces the
- * original error if it doesn't help.
+ * original error if it doesn't help. Under pool routing a refresh that does
+ * not help also benches the account for the default cooldown, so there a false
+ * positive costs one failover and a later re-check.
  */
 export function isExpiredTokenError(errMsg: string): boolean {
   const lower = errMsg.toLowerCase()
@@ -577,6 +601,7 @@ export function isExpiredTokenError(errMsg: string): boolean {
     lower.includes("oauth token has expired")
     || lower.includes("oauth access token has expired")
     || lower.includes("not logged in")
+    || SIGN_IN_LOST.test(lower)
   ) return true
   if (lower.includes("invalid_token") || lower.includes("token_expired")) return true
   if (lower.includes("401") && (lower.includes("authentication") || lower.includes("unauthorized") || lower.includes("invalid"))) return true
@@ -657,8 +682,12 @@ export function isRateLimitError(errMsg: string): boolean {
  * account that raised them and neither can succeed on a retry there, which is
  * exactly what makes another account worth trying.
  *
- * Deliberately absent: `authentication_error`, which the token refresh already
- * recovers in place, and the account-blind failures (`api_error`,
+ * Not in the set: `authentication_error`, because the token refresh normally
+ * recovers it in place and the class also covers loose matches (a tool's
+ * stderr saying "credentials"). It qualifies only with `signInLost`: the
+ * request saw an expired-token error and Meridian's refresh failed, or the
+ * retry after a refresh failed again — the account cannot serve anything until
+ * someone signs it in. Also absent: the account-blind failures (`api_error`,
  * `overloaded_error`, `timeout_error`) — those say nothing about entitlement,
  * and failing over on them would spend the whole pool on one upstream hiccup
  * and leave every account marked exhausted for something none of them did.
@@ -671,9 +700,12 @@ const ACCOUNT_FAILOVER_ERROR_TYPES: ReadonlySet<string> = new Set([
 /**
  * Whether a classified error type means "this account cannot serve the
  * request, another one might". Used by priority routing to decide failover.
+ * `signInLost` is the attempt's own record that Meridian could not repair
+ * the account's sign-in; see the set above.
  */
-export function isAccountFailoverError(errorType: string | null | undefined): errorType is string {
-  return typeof errorType === "string" && ACCOUNT_FAILOVER_ERROR_TYPES.has(errorType)
+export function isAccountFailoverError(errorType: string | null | undefined, signInLost = false): errorType is string {
+  if (typeof errorType !== "string") return false
+  return ACCOUNT_FAILOVER_ERROR_TYPES.has(errorType) || (signInLost && errorType === "authentication_error")
 }
 
 /**

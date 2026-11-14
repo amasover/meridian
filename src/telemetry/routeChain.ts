@@ -100,7 +100,9 @@ function collapseGroup(hops: RequestMetric[]): RequestMetric {
  * minute. Only these count as refusals: an `overloaded_error` or a
  * `upstream_timeout` says nothing about the account, and tallying it would
  * blame an account for an outage — the exact misattribution this tally exists
- * to prevent. Matches the set the pool router itself fails over on.
+ * to prevent. Matches the set the pool router itself fails over on, less the
+ * `authentication_error` it fails over on only when the sign-in is known lost:
+ * a row cannot tell that from a loose match, so it is not tallied here.
  */
 const ACCOUNT_REFUSALS: ReadonlySet<string> = new Set(["rate_limit_error", "billing_error"])
 

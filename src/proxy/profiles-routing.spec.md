@@ -158,6 +158,28 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   refusal carries a reset that is the account's own.
   A per-model weekly refusal benches each such profile for that model family
   only, the same way it benches the refused profile.
+- **A sign-in Meridian could not repair fails over, for a bounded bench.**
+  Pool routing fails over on `rate_limit_error` and `billing_error`, and on
+  `authentication_error` only when the attempt itself recorded that the
+  sign-in is lost: it saw an expired-token error (`isExpiredTokenError`,
+  which includes Claude Code's own "Failed to authenticate: OAuth session
+  expired and could not be refreshed") and Meridian's refresh failed, or the
+  retry after a successful refresh failed the same way. The class alone is
+  not enough: it also covers loose matches (a tool's stderr saying
+  "credentials", a code-1 exit), and failing over on those would bench healthy
+  accounts. The attempt carries the fact on its exposure record, set before
+  its error is delivered, so the JSON and SSE sniffers read it with the error
+  type. Observed live: one account's refresh failed and every request routed to
+  it failed for ten hours while a signed-in account in the same pool sat
+  unused. The bench is the conservative 10-minute default, per profile, with
+  no twins (another profile on the same account holds its own sign-in): long
+  enough not to spend an attempt per request on a dead sign-in, short enough
+  that a transient refresh failure or a `claude login` outside the server is
+  re-checked by the next request after it. A Meridian sign-in or a successful
+  `/auth/refresh` clears it at once (`clearStaleProfileHealth`). Pool candidate
+  selection does not consult the cached `claude auth status`: it is not
+  guaranteed fresh on the routing path, and a stale `loggedIn: false` would
+  hide an account that was just signed in.
 - **A finished sign-in reports its re-read.** Every completed sign-in marks the
   profile `factsRefresh: updating` before the route answers, re-reads account,
   usage and auth status, then clears it or reports `failed` with the reason for
@@ -243,6 +265,9 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   polls `/profiles/list` (any open Meridian page does). On an instance with no
   page open, the busy twin has usually renewed, so the request still tries it
   once and hears the same refusal, as it did before.
+- A sign-in renewed outside the server (`claude login`, the
+  `meridian profile login` CLI) is not seen until the 10-minute bench ends;
+  the server is not told about it.
 - **No failover after content streams.** A rate limit arriving after the first
   real SSE frame is relayed to the client instead of failing over —
   deliberately, so a stream the client is consuming is never yanked.

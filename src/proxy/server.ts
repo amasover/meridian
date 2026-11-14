@@ -443,6 +443,11 @@ interface CacheKeepaliveRegistration {
 interface PriorityAttemptExposure {
   committed: boolean
   reason?: string
+  /** Set before the attempt's error is delivered when it failed on an
+   *  expired-token error Meridian's refresh did not repair: the account's
+   *  sign-in is lost, so its `authentication_error` qualifies for failover
+   *  (`isAccountFailoverError`). */
+  signInLost?: boolean
 }
 
 interface HandleMessagesOptions {
@@ -1768,7 +1773,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    *  The status gate is `!res.ok` rather than a literal 429
    *  because the qualifying types do not share one status — a spent quota
    *  window is 429, a refused subscription 402. */
-  async function sniffAccountFailure(res: Response): Promise<
+  async function sniffAccountFailure(res: Response, signInLost: boolean): Promise<
     | { failed: true; errorPayload: unknown; errorType: string; response: Response }
     | { failed: false; errorPayload: null; errorType: null; response: Response }
   > {
@@ -1777,7 +1782,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
     const errorType = body?.error?.type
-    if (isAccountFailoverError(errorType)) {
+    if (isAccountFailoverError(errorType, signInLost)) {
       return { failed: true, errorPayload: body, errorType, response: res }
     }
     return { failed: false, errorPayload: null, errorType: null, response: res }
@@ -1973,7 +1978,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               ? start
               : await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken, requestAbort, activeExposure)
             lastInner = inner
-            const verdict = await relayStreamAttempt(inner, { ...sink, isCancelled })
+            const verdict = await relayStreamAttempt(inner, { ...sink, isCancelled }, () => exposure.signInLost === true)
             if (verdict.kind === "suppressed") {
               // Cancel BEFORE joining cleanup, then read the final exposure
               // state. Cleanup may itself latch a side effect; testing the
@@ -2186,7 +2191,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset, sharedQuota,
         })
       }
-      const sniffed = await sniffAccountFailure(inner)
+      const sniffed = await sniffAccountFailure(inner, exposure.signInLost === true)
       if (!sniffed.failed) {
         if (options.sessionKey && !options.durableRoute) {
           // Process memory preserves only legacy/keyless new-conversation
@@ -2633,6 +2638,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           if (!exposure || exposure.committed) return
           exposure.committed = true
           exposure.reason = reason
+        }
+        const markPrioritySignInLost = (): void => {
+          if (options.priorityAttemptExposure) options.priorityAttemptExposure.signInLost = true
         }
         const observePriorityAttemptMessage = (message: any): void => {
           // SDK error assistants describe a refusal, not content delivered to the
@@ -5226,17 +5234,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   }
 
                   // Expired OAuth token: refresh once and retry
-                  if (isExpiredTokenError(errMsg) && !tokenRefreshed) {
-                    tokenRefreshed = true
-                    const refreshed = profileCredentialStore
-                      ? await refreshOAuthToken(profileCredentialStore)
-                      : false
-                    if (refreshed) {
-                      claudeLog("token_refresh.retrying", { mode: "non_stream" })
-                      plog(`[PROXY] ${requestMeta.requestId} OAuth token expired — refreshed, retrying`)
-                      continue
+                  if (isExpiredTokenError(errMsg)) {
+                    if (!tokenRefreshed) {
+                      tokenRefreshed = true
+                      const refreshed = profileCredentialStore
+                        ? await refreshOAuthToken(profileCredentialStore)
+                        : false
+                      if (refreshed) {
+                        claudeLog("token_refresh.retrying", { mode: "non_stream" })
+                        plog(`[PROXY] ${requestMeta.requestId} OAuth token expired — refreshed, retrying`)
+                        continue
+                      }
                     }
-                    // Refresh failed — fall through and surface the error
+                    // The refresh failed, or the retry after it failed the same
+                    // way: surface the error, and let pool routing move on.
+                    markPrioritySignInLost()
                   }
 
                   // Rate-limit retry: first strip [1m] (free, different tier), then backoff
@@ -6649,17 +6661,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     }
 
                     // Expired OAuth token: refresh once and retry
-                    if (isExpiredTokenError(errMsg) && !tokenRefreshed) {
-                      tokenRefreshed = true
-                      const refreshed = profileCredentialStore
-                        ? await refreshOAuthToken(profileCredentialStore)
-                        : false
-                      if (refreshed) {
-                        claudeLog("token_refresh.retrying", { mode: "stream" })
-                        plog(`[PROXY] ${requestMeta.requestId} OAuth token expired — refreshed, retrying`)
-                        continue
+                    if (isExpiredTokenError(errMsg)) {
+                      if (!tokenRefreshed) {
+                        tokenRefreshed = true
+                        const refreshed = profileCredentialStore
+                          ? await refreshOAuthToken(profileCredentialStore)
+                          : false
+                        if (refreshed) {
+                          claudeLog("token_refresh.retrying", { mode: "stream" })
+                          plog(`[PROXY] ${requestMeta.requestId} OAuth token expired — refreshed, retrying`)
+                          continue
+                        }
                       }
-                      // Refresh failed — fall through and surface the error
+                      // The refresh failed, or the retry after it failed the
+                      // same way: surface the error, and let pool routing move on.
+                      markPrioritySignInLost()
                     }
 
                     // Rate-limit retry: first strip [1m] (free, different tier), then backoff
